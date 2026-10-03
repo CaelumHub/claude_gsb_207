@@ -4,7 +4,7 @@
 <div class="main-head">
   <div>
     <h1>混音台</h1>
-    <div class="sub">多轨混音 · 增益 / 声像 / 静音 · 主输出 · 项目配置存 JSON（每次修改自动版本化）</div>
+    <div class="sub">多轨混音 · 增益 / 声像 / 静音 · 主输出 · 项目配置存 JSON（修改自动版本化，连续拖动合并为单个版本）</div>
   </div>
 </div>
 
@@ -45,7 +45,8 @@
 
 {% block scripts %}
 <script>
-let project = null, library = [], saving = false;
+let project = null, library = [];
+let saveTimer = null, saving = false, pendingSave = false, pendingCoalesce = false;
 
 async function loadLibrary() { library = await API.get("/api/library"); }
 
@@ -70,6 +71,7 @@ async function loadProjects(selected) {
 }
 
 async function openProject(id) {
+  if (saveTimer) saveProject();  // flush a pending debounced save for the previous project
   project = await API.get("/api/projects/" + id);
   $("#projName").value = project.name;
   $("#masterGain").value = project.master?.gain ?? 1;
@@ -101,20 +103,46 @@ function renderTracks() {
     </div>`).join("");
 }
 
+// Slider drags fire "input" continuously; debounce those saves and flag them
+// coalesce=1 so the backend merges the whole gesture into a single version.
+function scheduleSave() {
+  pendingCoalesce = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveProject, 600);
+}
+
 async function saveProject() {
-  if (!project || saving) return;
+  if (!project) return;
+  if (saving) { pendingSave = true; return; }  // trailing save with the latest state
+  clearTimeout(saveTimer); saveTimer = null;
   saving = true;
-  await API.put(`/api/projects/${project.id}`, project);
+  const coalesce = pendingCoalesce; pendingCoalesce = false;
+  try {
+    await API.put(`/api/projects/${project.id}${coalesce ? "?coalesce=1" : ""}`, project);
+  } catch (e) { toast(e.message, "error"); }
   saving = false;
+  if (pendingSave) { pendingSave = false; saveProject(); }
 }
 
 $("#tracks").addEventListener("input", e => {
   const d = e.target.dataset;
   if (d.t == null || !project) return;
   const t = project.tracks[+d.t];
-  const val = d.k === "muted" ? e.target.checked : +e.target.value;
+  if (d.k === "muted") {  // discrete toggle: version it immediately
+    t.muted = e.target.checked;
+    saveProject();
+    return;
+  }
+  const val = +e.target.value;  // continuous drag: update UI now, save on settle
   t[d.k] = val;
-  e.target.parentElement.querySelector("span") && (e.target.parentElement.querySelector("span").textContent = d.k === "muted" ? "" : val.toFixed(2));
+  const span = e.target.parentElement.querySelector("span");
+  if (span) span.textContent = val.toFixed(2);
+  scheduleSave();
+});
+// Fires when a drag ends (or a keyboard step commits): persist right away.
+$("#tracks").addEventListener("change", e => {
+  const d = e.target.dataset;
+  if (d.t == null || !project || d.k === "muted") return;
   saveProject();
 });
 $("#tracks").addEventListener("click", async e => {
@@ -142,8 +170,9 @@ $("#newProject").onclick = async () => {
 $("#projectSel").onchange = e => openProject(e.target.value);
 $("#masterGain").oninput = e => {
   $("#masterVal").textContent = (+e.target.value).toFixed(2);
-  if (project) { project.master = project.master || {}; project.master.gain = +e.target.value; saveProject(); }
+  if (project) { project.master = project.master || {}; project.master.gain = +e.target.value; scheduleSave(); }
 };
+$("#masterGain").onchange = () => saveProject();
 
 $("#mixBtn").onclick = async () => {
   if (!project || !project.tracks.length) return toast("请先添加轨道", "warn");

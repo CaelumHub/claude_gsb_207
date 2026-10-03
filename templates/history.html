@@ -69,7 +69,7 @@ async function loadVersions(id) {
       <td class="mono">v${v.version}${v.version === p.version ? ' <span class="badge green">当前</span>' : ""}</td>
       <td>${v.updated_at || v.snapshot_at}</td>
       <td>${v.tracks ? v.tracks.length : "-"}</td>
-      <td class="small muted">${v.reverted_from ? `由 v${v.reverted_from} 回滚` : (v.version === 1 ? "初始创建" : "修改")}</td>
+      <td class="small muted">${v.reverted_from ? `由 v${v.reverted_from} 回滚` : (v.version === 1 ? "初始创建" : (v.continuous ? "连续调整（已合并）" : "修改"))}</td>
       <td>
         ${v.version !== p.version ? `<button class="btn-sm" onclick="revert(${v.version})">回滚到此版本</button>` : ""}
       </td>

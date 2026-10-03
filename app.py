@@ -552,7 +552,11 @@ def api_project(project_id: str):
 
 @app.put("/api/projects/<project_id>")
 def api_update_project(project_id: str):
-    p = store.update_project(project_id, request.get_json(force=True) or {})
+    # Slider drags send ?coalesce=1 so a continuous gesture merges into a
+    # single version instead of one version per intermediate value.
+    coalesce = request.args.get("coalesce") == "1"
+    p = store.update_project(project_id, request.get_json(force=True) or {},
+                             coalesce=coalesce)
     if not p:
         return jsonify(error="project not found"), 404
     return jsonify(p)

@@ -46,6 +46,13 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
+# Continuous controls (mixer gain/pan sliders) fire many updates per gesture.
+# An update flagged ``coalesce=True`` overwrites the latest snapshot instead of
+# creating a new version when that snapshot is itself a continuous one younger
+# than this window — so one drag yields one version, not dozens.
+COALESCE_WINDOW_SEC = 2.0
+
+
 def new_id() -> str:
     return uuid.uuid4().hex[:16]
 
@@ -297,18 +304,29 @@ class Storage:
         out.sort(key=lambda p: p.get("updated_at", ""), reverse=True)
         return out
 
-    def update_project(self, project_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def update_project(self, project_id: str, patch: Dict[str, Any],
+                       coalesce: bool = False) -> Optional[Dict[str, Any]]:
         path = self._project_path(project_id)
         with locked(path + ".lock"):
             project = read_json(path, None)
             if project is None:
                 return None
             project.update(patch)
-            project["version"] = int(project.get("version", 0)) + 1
             project["updated_at"] = now_iso()
+            if not (coalesce and self._fresh_continuous_snapshot(project)):
+                project["version"] = int(project.get("version", 0)) + 1
             atomic_write(path, project)
-        self._snapshot_project(project)
+        self._snapshot_project(project, continuous=coalesce)
         return project
+
+    def _fresh_continuous_snapshot(self, project: Dict[str, Any]) -> bool:
+        """True when the current version's snapshot is a continuous one inside
+        the coalescing window — i.e. this update belongs to the same drag
+        gesture and should merge into it rather than open a new version."""
+        snap = self.get_version(project["id"], int(project.get("version", 0)))
+        if not snap or not snap.get("continuous"):
+            return False
+        return time.time() - snap.get("snapshot_ts", 0.0) <= COALESCE_WINDOW_SEC
 
     def delete_project(self, project_id: str) -> bool:
         path = self._project_path(project_id)
@@ -325,10 +343,15 @@ class Storage:
         return [os.path.join(self.versions_dir, n) for n in os.listdir(self.versions_dir)
                 if n.startswith(prefix) and n.endswith(".json")]
 
-    def _snapshot_project(self, project: Dict[str, Any]) -> None:
+    def _snapshot_project(self, project: Dict[str, Any], continuous: bool = False) -> None:
         vid = f"{project['id']}__{int(project.get('version', 1)):04d}.json"
         snap = dict(project)
         snap["snapshot_at"] = now_iso()
+        snap["snapshot_ts"] = time.time()  # second-resolution ISO is too coarse for coalescing
+        if continuous:
+            snap["continuous"] = True
+        else:
+            snap.pop("continuous", None)
         with locked(os.path.join(self.versions_dir, vid) + ".lock"):
             atomic_write(os.path.join(self.versions_dir, vid), snap)
 
@@ -356,6 +379,8 @@ class Storage:
                 return None
             restored = dict(snap)
             restored.pop("snapshot_at", None)
+            restored.pop("snapshot_ts", None)
+            restored.pop("continuous", None)
             restored["version"] = int(current.get("version", 0)) + 1
             restored["updated_at"] = now_iso()
             restored["reverted_from"] = int(current.get("version", 0))
