@@ -50,6 +50,18 @@ def new_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
+# Updates arriving within this many seconds of the project's latest snapshot
+# are folded into that snapshot instead of creating a new version.  Without
+# this, a single continuous slider drag on the mixer (which fires one update
+# per tiny movement) floods the history with dozens of near-identical
+# versions and buries the meaningful edits.
+VERSION_COALESCE_SECONDS = 5.0
+
+# Project fields managed by the server; a client may echo them back in an
+# update payload but they must never overwrite the server's own values.
+_PROJECT_READONLY = ("id", "version", "created_at", "updated_at", "reverted_from")
+
+
 # --------------------------------------------------------------------------- #
 # File lock
 # --------------------------------------------------------------------------- #
@@ -303,11 +315,20 @@ class Storage:
             project = read_json(path, None)
             if project is None:
                 return None
+            patch = {k: v for k, v in patch.items() if k not in _PROJECT_READONLY}
             project.update(patch)
-            project["version"] = int(project.get("version", 0)) + 1
+            project.pop("reverted_from", None)  # no longer the direct product of a revert
             project["updated_at"] = now_iso()
-            atomic_write(path, project)
-        self._snapshot_project(project)
+            snap_path, snap = self._latest_snapshot(project_id)
+            if snap_path and self._coalescable(snap_path, project, snap):
+                # Continuous adjustment (e.g. a slider drag): fold the new
+                # state into the latest snapshot instead of adding a version.
+                atomic_write(path, project)
+                self._write_snapshot(snap_path, project)
+            else:
+                project["version"] = int(project.get("version", 0)) + 1
+                atomic_write(path, project)
+                self._snapshot_project(project)
         return project
 
     def delete_project(self, project_id: str) -> bool:
@@ -325,12 +346,53 @@ class Storage:
         return [os.path.join(self.versions_dir, n) for n in os.listdir(self.versions_dir)
                 if n.startswith(prefix) and n.endswith(".json")]
 
-    def _snapshot_project(self, project: Dict[str, Any]) -> None:
-        vid = f"{project['id']}__{int(project.get('version', 1)):04d}.json"
+    def _latest_snapshot(self, project_id: str) -> tuple:
+        """Return ``(path, doc)`` of the highest-numbered snapshot, or ``(None, None)``."""
+        best_path, best_ver = None, -1
+        for vp in self._version_glob(project_id):
+            stem = os.path.basename(vp)[:-len(".json")]
+            try:
+                ver = int(stem.rsplit("__", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if ver > best_ver:
+                best_path, best_ver = vp, ver
+        if best_path is None:
+            return None, None
+        return best_path, read_json(best_path, None)
+
+    @staticmethod
+    def _coalescable(snap_path: str, project: Dict[str, Any],
+                     snap: Optional[Dict[str, Any]]) -> bool:
+        """True if the update may be folded into the latest snapshot ``snap``.
+
+        Only rapid, non-structural adjustments coalesce: a revert landmark is
+        never rewritten, and adding/removing/reordering tracks always starts
+        a new version so structural edits stay visible in the history.  The
+        snapshot file's mtime (float-second precision) is used for the age
+        check — the ISO ``snapshot_at`` string is only second-resolution.
+        """
+        if not snap or snap.get("reverted_from"):
+            return False
+        try:
+            age = time.time() - os.path.getmtime(snap_path)
+        except OSError:
+            return False
+        if age > VERSION_COALESCE_SECONDS:
+            return False
+        old_ids = [t.get("file_id") for t in snap.get("tracks", [])]
+        new_ids = [t.get("file_id") for t in project.get("tracks", [])]
+        return old_ids == new_ids
+
+    def _write_snapshot(self, path: str, project: Dict[str, Any]) -> None:
         snap = dict(project)
         snap["snapshot_at"] = now_iso()
-        with locked(os.path.join(self.versions_dir, vid) + ".lock"):
-            atomic_write(os.path.join(self.versions_dir, vid), snap)
+        with locked(path + ".lock"):
+            atomic_write(path, snap)
+
+    def _snapshot_project(self, project: Dict[str, Any]) -> None:
+        vid = f"{project['id']}__{int(project.get('version', 1)):04d}.json"
+        self._write_snapshot(os.path.join(self.versions_dir, vid), project)
 
     def list_versions(self, project_id: str) -> List[Dict[str, Any]]:
         out = []

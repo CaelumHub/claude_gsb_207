@@ -45,7 +45,36 @@
 
 {% block scripts %}
 <script>
-let project = null, library = [], saving = false;
+let project = null, library = [], saving = false, saveAgain = false, saveTimer = null, dirty = false;
+
+async function saveProject() {
+  const p = project;  // capture: the user may switch projects mid-flight
+  if (!p || !dirty) return;
+  if (saving) { saveAgain = true; return; }  // in flight → run once more after
+  saving = true;
+  dirty = false;  // the PUT body snapshots everything up to now; edits
+                  // during the flight re-mark dirty and get a trailing save
+  try {
+    const resp = await API.put(`/api/projects/${p.id}`, p);
+    p.version = resp.version;  // stay in sync with the server-side version
+  } catch (e) { dirty = true; toast(e.message, "error"); }
+  saving = false;
+  if (saveAgain) { saveAgain = false; saveProject(); }
+}
+
+// Continuous drags fire dozens of "input" events; debounce them so one
+// gesture collapses into a single save (and a single history version).
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveProject, 800);
+}
+
+// Discrete changes (slider released, track added/removed) save immediately.
+function saveNow() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  saveProject();
+}
 
 async function loadLibrary() { library = await API.get("/api/library"); }
 
@@ -101,13 +130,6 @@ function renderTracks() {
     </div>`).join("");
 }
 
-async function saveProject() {
-  if (!project || saving) return;
-  saving = true;
-  await API.put(`/api/projects/${project.id}`, project);
-  saving = false;
-}
-
 $("#tracks").addEventListener("input", e => {
   const d = e.target.dataset;
   if (d.t == null || !project) return;
@@ -115,12 +137,18 @@ $("#tracks").addEventListener("input", e => {
   const val = d.k === "muted" ? e.target.checked : +e.target.value;
   t[d.k] = val;
   e.target.parentElement.querySelector("span") && (e.target.parentElement.querySelector("span").textContent = d.k === "muted" ? "" : val.toFixed(2));
-  saveProject();
+  dirty = true;
+  scheduleSave();
+});
+$("#tracks").addEventListener("change", e => {
+  // Fired when a slider is released or a checkbox toggled → commit the gesture.
+  if (e.target.dataset.t != null) saveNow();
 });
 $("#tracks").addEventListener("click", async e => {
   if (e.target.dataset.del != null && project) {
     project.tracks.splice(+e.target.dataset.del, 1);
-    renderTracks(); saveProject();
+    dirty = true;
+    renderTracks(); saveNow();
   }
 });
 
@@ -129,21 +157,24 @@ $("#addTrack").onclick = async () => {
   if (!project) return toast("请先新建或选择项目", "warn");
   if (!fid) return toast("请选择要添加的音频", "warn");
   project.tracks.push({ file_id: fid, gain: 1, pan: 0, muted: false });
-  renderTracks(); saveProject();
+  dirty = true;
+  renderTracks(); saveNow();
   toast("已添加轨道", "success");
 };
 
 $("#newProject").onclick = async () => {
+  saveNow();  // flush pending edits to the current project first
   const p = await API.post("/api/projects", { name: $("#projName").value || "未命名项目", tracks: [] });
   await loadProjects(p.id);
   toast("已创建项目", "success");
 };
 
-$("#projectSel").onchange = e => openProject(e.target.value);
+$("#projectSel").onchange = e => { saveNow(); openProject(e.target.value); };
 $("#masterGain").oninput = e => {
   $("#masterVal").textContent = (+e.target.value).toFixed(2);
-  if (project) { project.master = project.master || {}; project.master.gain = +e.target.value; saveProject(); }
+  if (project) { project.master = project.master || {}; project.master.gain = +e.target.value; dirty = true; scheduleSave(); }
 };
+$("#masterGain").onchange = () => saveNow();
 
 $("#mixBtn").onclick = async () => {
   if (!project || !project.tracks.length) return toast("请先添加轨道", "warn");
